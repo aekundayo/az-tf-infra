@@ -1,0 +1,188 @@
+name: deploy_base
+
+
+on:
+  workflow_call:
+    inputs:
+      DIR:
+        required: true
+        type: string
+      scriptsDir:
+        required: true
+        type: string
+      environment:
+        required: true
+        type: string
+      keyvaultName:
+        required: true
+        type: string
+
+jobs:
+  build:
+    concurrency: deployment-${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      ARM_CLIENT_ID: ${{ secrets.TF_VAR_ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.TF_VAR_ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.TF_VAR_ARM_TENANT_ID }}    
+      TF_VAR_LOWER_SUBSCRIPTION: ${{ secrets.TF_VAR_LOWER_SUBSCRIPTION }}
+      TF_VAR_STATIC_SHARE_NAME: ${{ secrets.TF_VAR_STATIC_SHARE_NAME }}
+      TF_VAR_STATIC_STORE_KEY: ${{ secrets.TF_VAR_STATIC_STORE_KEY }}
+      TF_VAR_STATIC_STORE_NAME: ${{ secrets.TF_VAR_STATIC_STORE_NAME }}
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v3
+      #login to azure
+      - name: 'Login via Azure CLI'
+        uses: azure/login@v1
+        with:
+            creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.3.5
+          terraform_wrapper: false # https://github.com/gruntwork-io/terragrunt/issues/1202
+  
+      - name: tfsec
+        uses: aquasecurity/tfsec-pr-commenter-action@v1.2.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tfsec_formats: sarif,csv
+          tfsec_args: --soft-fail
+      #- name: Terraform Format
+      #  id: fmt
+      #  run: terraform fmt -check
+      #  working-directory: ${{ inputs.DIR }}
+
+      - name: Terraform Init
+        id: init
+        run: terraform init --backend-config=backend.conf
+        working-directory: ${{ inputs.DIR }}
+
+      #- name: Terraform Destroy
+      #  id: destroy
+      #  run: terraform destroy -auto-approve -input=false -var-file="terraform.tfvars"
+      #  working-directory: ${{ inputs.DIR }}
+
+      - name: Terraform Workspace
+        id: workspace
+        run: terraform workspace select ${{ inputs.environment }} || terraform workspace new ${{ inputs.environment }}
+        working-directory: ${{ inputs.DIR }}
+      
+      - name: Add Shared Storage Account Info to Key Vault
+        id: initilaise_vault
+        uses: azure/CLI@v1
+        continue-on-error: true
+        with:
+          inlineScript: |
+            #!/bin/bash
+            # Extract SSH Keys from Key Vault is present.
+            # Check other secrets are present in the Key Vault
+            STATIC_SHARE_NAME=$(az keyvault secret show --vault-name  ${{ inputs.keyvaultName }} --name staticFileShareName --query value --output tsv || true)
+            STATIC_STORAGE_KEY=$(az keyvault secret show --vault-name  ${{ inputs.keyvaultName }} --name staticStorageAccKey --query value --output tsv || true)
+            STATIC_STORE_NAME=$(az keyvault secret show --vault-name  ${{ inputs.keyvaultName }} --name staticStorageAccName --query value --output tsv || true)
+
+            if [[ -z "$STATIC_SHARE_NAME" ]]; then
+              echo "testing if static share name is null"
+              az keyvault secret set --description "Storage Share Name" --name staticFileShareName --value ${{ secrets.TF_VAR_STATIC_SHARE_NAME }} --vault-name ${{ inputs.keyvaultName }}
+            fi
+
+            if [[ -z "$STATIC_STORAGE_KEY" ]]; then
+              az keyvault secret set --description "Storage Share Key" --name staticStorageAccKey --value ${{ secrets.TF_VAR_STATIC_STORE_KEY }} --vault-name ${{ inputs.keyvaultName }}
+            fi
+
+            if [[ -z "$STATIC_STORE_NAME" ]]; then
+              az keyvault secret set --description "Storage Name" --name staticStorageAccName --value ${{ secrets.TF_VAR_STATIC_STORE_NAME }} --vault-name ${{ inputs.keyvaultName }}
+            fi
+      - name: Run SSH Key Gen
+        id: step_one
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            #!/bin/bash
+            # Extract SSH Keys from Key Vault is present.
+            SSH_KEY_PRIVATE=$(az keyvault secret show --vault-name  ${{ inputs.keyvaultName }} --name agentVMPrivateKey --query value --output tsv || true)
+            SSH_KEY_PUBLIC=$(az keyvault secret show --vault-name  ${{ inputs.keyvaultName }} --name agentVMPublicKey --query value --output tsv || true)
+            # Check if SSH_KEY_PRIVATE and SSH_KEY_PUBLIC are not null
+            if [[ -n "$SSH_KEY_PRIVATE" && -n "$SSH_KEY_PUBLIC" ]]; then
+              echo "SSH_KEY_PRIVATE and SSH_KEY_PUBLIC are not null, writing content to files"
+              
+              # Write the contents of SSH_KEY_PRIVATE into agent_ssh_private.pem
+              echo "$SSH_KEY_PRIVATE" > ${{ inputs.scriptsDir }}/agent_ssh
+              echo "written private key"
+              
+              
+              # Write the contents of SSH_KEY_PUBLIC into agent_ssh_public.pem
+              echo "$SSH_KEY_PUBLIC" > ${{ inputs.scriptsDir }}/agent_ssh.pub
+              echo "written public key"
+              
+            else
+              echo "Either SSH_KEY_PRIVATE or SSH_KEY_PUBLIC is null, recreating ssh keys"
+              ${{ inputs.DIR }}/ssh_keygen.sh ${{ inputs.scriptsDir }} agent_ssh
+            fi
+          
+      - name: Run VPN CERT and Key Gen
+        id: step_two
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            #!/bin/bash
+            # Extract SSH Keys from Key Vault is present.
+            VPN_SERVER_KEY=$(az keyvault secret show --vault-name  ${{ inputs.keyvaultName }} --name VPNRootCAKey --query value --output tsv || true)
+            VPN_SERVER_CRT=$(az keyvault secret show --vault-name  ${{ inputs.keyvaultName }} --name VPNRootCACrt --query value --output tsv || true)
+            VPN_CLIENT_KEY=$(az keyvault secret show --vault-name  ${{ inputs.keyvaultName }} --name VPNClientKey --query value --output tsv || true)
+            VPN_CLIENT_CRT=$(az keyvault secret show --vault-name  ${{ inputs.keyvaultName }} --name VPNClientCrt --query value --output tsv || true)
+            # Check if VPN_SERVER_KEY, VPN_SERVER_CRT, VPN_CLIENT_KEY, VPN_CLIENT_CRT are not null
+            if [[ -n "$VPN_SERVER_KEY" && -n "$VPN_SERVER_CRT" && -n "$VPN_CLIENT_KEY" && -n "$VPN_CLIENT_CRT" ]]; then
+              echo "VPN_SERVER_KEY and VPN_SERVER_CRT are not null, writing content to files"
+              
+              # Write the contents of VPN_SERVER_KEY into RootCA.key
+              echo "$VPN_SERVER_KEY" > ${{ inputs.scriptsDir }}/RootCA.key
+              echo "written rootca key"
+              
+              
+              # Write the contents of VPN_SERVER_CRT into RootCA.crt
+              echo "$VPN_SERVER_CRT" > ${{ inputs.scriptsDir }}/RootCA.crt
+              echo "written rootca crt"
+              
+
+              # Write the contents of VPN_CLIENT_KEY into ClientCertificate.key
+              echo "$VPN_CLIENT_KEY" > ${{ inputs.scriptsDir }}/ClientCertificate.key
+              echo "written Client Certificate key"
+              
+              
+              # Write the contents of VPN_CLIENT_CRT into ClientCertificate.crt
+              echo "$VPN_CLIENT_CRT" > ${{ inputs.scriptsDir }}/ClientCertificate.crt
+              echo "written public key"
+              
+            else
+              echo "Either  VPN_SERVER_KEY, VPN_SERVER_CRT, VPN_CLIENT_KEY, VPN_CLIENT_CRT is null, recreating vpn certs & keys"
+              ${{ inputs.DIR }}/vpn-certgen.sh ${{ inputs.scriptsDir }} RootCA ClientCertificate
+            fi
+        #- name: Run SSH Key Gen
+        #  env:
+        #    ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+        #  run: |
+        #    ./ssh_keygen.sh . agent_ssh
+        #  working-directory: ${{ inputs.DIR }}
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate 
+        working-directory: ${{ inputs.DIR }}
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -input=false -var-file="terraform.tfvars" -out=tfplan
+        working-directory: ${{ inputs.DIR }}
+      
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -input=false tfplan
+        working-directory: ${{ inputs.DIR }}
+

@@ -1,0 +1,53 @@
+name: Start Deploy
+
+on:
+  push:
+    branches:
+      - "main"
+  workflow_dispatch:
+ 
+jobs:
+
+  deployDev:    
+    if: github.ref == 'refs/heads/main'
+    uses: ECCOShoes/digital-showroom-infrastructure/.github/workflows/deploy_base.yaml@main
+    with:
+      DIR: 'environment'
+      scriptsDir: 'scripts'
+      environment: dev
+      keyvaultName: kvlt-ds-dev-westeurope
+    secrets: inherit
+  
+  deployTest:
+    needs: deployDev    
+    if: github.ref == 'refs/heads/main'
+    uses: ECCOShoes/digital-showroom-infrastructure/.github/workflows/deploy_base.yaml@main
+    with:
+      DIR: 'environment'
+      scriptsDir: 'scripts'
+      environment: test
+      keyvaultName: kvlt-ds-test-westeurope
+    secrets: inherit
+  
+  deployPreProd:
+    needs: deployTest    
+    if: github.ref == 'refs/heads/main'
+    uses: ECCOShoes/digital-showroom-infrastructure/.github/workflows/deploy_base.yaml@main
+    with:
+      DIR: 'environment'
+      scriptsDir: 'scripts'
+      environment: uat
+      keyvaultName: kvlt-ds-uat-westeurope
+    secrets: inherit
+
+  deployProd:
+    needs: deployPreProd    
+    if: github.ref == 'refs/heads/main'
+    uses: ECCOShoes/digital-showroom-infrastructure/.github/workflows/deploy_base.yaml@main
+    with:
+      DIR: 'environment'
+      scriptsDir: 'scripts'
+      environment: prod
+      keyvaultName: kvlt-ds-prod-westeurope
+    secrets: inherit
+    
